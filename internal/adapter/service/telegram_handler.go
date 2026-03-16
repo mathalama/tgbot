@@ -175,12 +175,12 @@ func (h *TelegramCommandHandler) HandleDocument(ctx context.Context, update tgbo
 	fileSize := update.Message.Document.FileSize
 
 	if fileSize > 1000000 { // 1MB max
-		return h.sendMessage("❌ Файл слишком большой (макс 1MB)")
+		return h.sendMessage("❌ Файл слишком большой (макс 1MB)\n\n💡 Подсказка: Убедитесь что отправляете только текст CV без шрифтов и изображений")
 	}
 
 	// Проверяем расширение
 	if !strings.HasSuffix(fileName, ".txt") && !strings.HasSuffix(fileName, ".pdf") && !strings.HasSuffix(fileName, ".tex") {
-		return h.sendMessage("❌ Поддерживаются только .txt, .pdf и .tex файлы")
+		return h.sendMessage(fmt.Sprintf("❌ Формат файла не поддерживается: %s\n\n✅ Поддерживаемые форматы:\n• .txt (текстовый файл)\n• .pdf (документ PDF)\n• .tex (LaTeX)", fileName))
 	}
 
 	log.Printf("[TG] Received CV file: %s (%d bytes)", fileName, fileSize)
@@ -189,21 +189,36 @@ func (h *TelegramCommandHandler) HandleDocument(ctx context.Context, update tgbo
 	cvText := string(fileBytes)
 
 	if len(cvText) == 0 {
-		return h.sendMessage("❌ Файл пустой")
+		return h.sendMessage("❌ Файл пустой\n\n💡 Подсказка: Отправьте непустой файл с вашим резюме")
+	}
+
+	if len(cvText) < 50 {
+		return h.sendMessage(fmt.Sprintf("⚠️ Файл содержит очень мало текста (%d символов)\n\n💡 Рекомендуем добавить больше информации в резюме для точнее анализа", len(cvText)))
 	}
 
 	// Анализируем CV
-	h.sendMessage("⏳ Анализирую резюме...")
+	waitMsg, _ := h.sendMessageSimple("⏳ Анализирую резюме...")
 
 	err := h.analyzeCVUC.Execute(ctx, cvText)
 	if err != nil {
-		return h.sendMessage(fmt.Sprintf("❌ Ошибка при анализе: %v", err))
+		errorMsg := fmt.Sprintf("❌ Ошибка при анализе резюме\n\n%v", err)
+		if strings.Contains(err.Error(), "API") || strings.Contains(err.Error(), "api") {
+			errorMsg = "❌ Ошибка подключения к AI сервису\n\n💡 Проверьте интернет соединение и попробуйте позже"
+		}
+		h.editMessageText(waitMsg, errorMsg)
+		return nil
 	}
 
 	// Получаем количество навыков
 	skills, err := h.skillRepo.GetUserSkills(ctx)
 	if err != nil {
-		return h.sendMessage(fmt.Sprintf("❌ Ошибка при сохранении: %v", err))
+		h.editMessageText(waitMsg, fmt.Sprintf("❌ Ошибка при сохранении: %v\n\n💡 Попробуйте загрузить резюме снова", err))
+		return nil
+	}
+
+	if len(skills) == 0 {
+		h.editMessageText(waitMsg, "⚠️ Резюме загружено, но не удалось найти технологии\n\n💡 Убедитесь что в резюме есть названия известных инструментов, фреймворков или языков программирования")
+		return nil
 	}
 
 	// Группируем по категориям
@@ -218,15 +233,18 @@ func (h *TelegramCommandHandler) HandleDocument(ctx context.Context, update tgbo
 		categoryText += fmt.Sprintf("  • %s: %d\n", cat, count)
 	}
 
-	return h.sendMessage(fmt.Sprintf(
-		"✅ Резюме загружено!\n"+
-			"📊 Извлечено навыков: %d\n"+
+	h.editMessageText(waitMsg, fmt.Sprintf(
+		"✅ Резюме успешно загружено!\n"+
+			"📊 Найдено навыков: %d\n"+
 			"\n"+
 			"Категории:\n"+
-			"%s",
+			"%s\n"+
+			"📌 Теперь добавьте каналы командой /add_channel",
 		len(skills),
 		categoryText,
 	))
+
+	return nil
 }
 
 // cmdStart - команда /start
@@ -326,16 +344,17 @@ func (h *TelegramCommandHandler) cmdAddChannel(ctx context.Context, channelName 
 	channelName = strings.ToLower(strings.TrimSpace(channelName))
 
 	if channelName == "" {
-		return h.sendMessage("❌ Неверное название канала")
+		return h.sendMessage("❌ Неверное название канала\n\n✅ Правильное использование:\n/add_channel @golang_jobs\n/add_channel @python_vacancies")
 	}
 
 	// Добавляем канал
 	err := h.manageChannelsUC.AddChannel(ctx, channelName)
 	if err != nil {
-		return h.sendMessage(fmt.Sprintf("❌ Ошибка при добавлении: %v", err))
+		log.Printf("[ERROR] Failed to add channel: %v", err)
+		return h.sendMessage("❌ Ошибка при добавлении канала\n\n💡 Проверьте:\n• Правильное ли название канала?\n• Публичный ли это канал?\n• Доступен ли бот в этом канале?")
 	}
 
-	return h.sendMessage(fmt.Sprintf("✅ Канал @%s добавлен!\n\n⏰ Я буду проверять его каждые 30 минут и отправлять подходящие вакансии.", channelName))
+	return h.sendMessage(fmt.Sprintf("✅ Канал @%s добавлен!\n\n⏰ Я буду проверять его каждые 30 минут\n📌 Используй /my_channels чтобы увидеть все каналы", channelName))
 }
 
 // cmdRemoveChannel - удалить канал
@@ -345,37 +364,41 @@ func (h *TelegramCommandHandler) cmdRemoveChannel(ctx context.Context, channelNa
 	channelName = strings.ToLower(strings.TrimSpace(channelName))
 
 	if channelName == "" {
-		return h.sendMessage("❌ Неверное название канала")
+		return h.sendMessage("❌ Неверное название канала\n\n✅ Правильное использование:\n/remove_channel @golang_jobs")
 	}
 
 	// Удаляем канал
 	err := h.manageChannelsUC.RemoveChannel(ctx, channelName)
 	if err != nil {
-		return h.sendMessage(fmt.Sprintf("❌ Ошибка при удалении: %v", err))
+		log.Printf("[ERROR] Failed to remove channel: %v", err)
+		return h.sendMessage(fmt.Sprintf("❌ Ошибка при удалении канала @%s\n\n💡 Канал не найден или уже удален\n\nПосмотреть все каналы: /my_channels", channelName))
 	}
 
-	return h.sendMessage(fmt.Sprintf("✅ Канал @%s удален из отслеживаемых.", channelName))
+	return h.sendMessage(fmt.Sprintf("✅ Канал @%s удален из отслеживаемых", channelName))
 }
 
 // cmdMyChannels - список каналов
 func (h *TelegramCommandHandler) cmdMyChannels(ctx context.Context) error {
 	channels, err := h.manageChannelsUC.GetAllChannels(ctx)
 	if err != nil {
-		return h.sendMessage(fmt.Sprintf("❌ Ошибка: %v", err))
+		log.Printf("[ERROR] Failed to get channels: %v", err)
+		return h.sendMessage("❌ Ошибка при получении списка каналов\n\n💡 Попробуйте позже или используйте /add_channel для добавления нового")
 	}
 
 	if len(channels) == 0 {
-		return h.sendMessage("📭 Ты еще не добавил ни один канал для мониторинга\n\nНапиши /add_channel @channel_name чтобы начать 🚀")
+		return h.sendMessage("📭 Нет добавленных каналов\n\n✅ Добавьте первый канал:\n/add_channel @golang_jobs\n/add_channel @python_vacancies\n\n📌 Совет: Найдите каналы на Telegram по ключевым словам типа \"jobs\", \"vacancies\", \"recruitment\"")
 	}
 
 	text := "📋 Отслеживаемые каналы:\n\n"
 	for i, ch := range channels {
-		status := "✅"
+		status := "✅ Активний"
 		if !ch.IsActive {
-			status = "❌"
+			status = "⏸️ Неактивен"
 		}
 		text += fmt.Sprintf("%d. %s @%s\n", i+1, status, ch.Username)
 	}
+
+	text += fmt.Sprintf("\n💾 Всего: %d канал(ов)", len(channels))
 
 	return h.sendMessage(text)
 }
@@ -384,11 +407,12 @@ func (h *TelegramCommandHandler) cmdMyChannels(ctx context.Context) error {
 func (h *TelegramCommandHandler) cmdMyCV(ctx context.Context) error {
 	skills, err := h.skillRepo.GetUserSkills(ctx)
 	if err != nil {
-		return h.sendMessage(fmt.Sprintf("❌ Ошибка: %v", err))
+		log.Printf("[ERROR] Failed to get skills: %v", err)
+		return h.sendMessage("❌ Ошибка при получении навыков\n\n💡 Загрузите резюме командой отправив файл")
 	}
 
 	if len(skills) == 0 {
-		return h.sendMessage("📭 Резюме еще не загружено\n\nПришли файл своего резюме чтобы я мог сделать подробный анализ и сравнивать с вакансиями")
+		return h.sendMessage("📭 Резюме еще не загружено\n\n✅ Что делать:\n1. Напишите резюме в файл (формат .txt, .pdf или .tex)\n2. Отправьте файл боту\n3. Я анализирую навыки и буду сравнивать с вакансиями\n\n📌 Пример резюме:\n- Go, Python, JavaScript\n- React, Vue, Django\n- PostgreSQL, MongoDB\n- Docker, Kubernetes")
 	}
 
 	// Группируем по категориям с правильным порядком
@@ -470,9 +494,24 @@ func (h *TelegramCommandHandler) cmdMyCV(ctx context.Context) error {
 // cmdStats - статистика
 func (h *TelegramCommandHandler) cmdStats(ctx context.Context) error {
 	// Получаем статистику
-	channels, _ := h.manageChannelsUC.GetAllChannels(ctx)
-	vacancies, _ := h.vacancyRepo.GetAllVacancies(ctx)
-	skills, _ := h.skillRepo.GetUserSkills(ctx)
+	channels, errCh := h.manageChannelsUC.GetAllChannels(ctx)
+	if errCh != nil {
+		log.Printf("[ERROR] Failed to get channels for stats: %v", errCh)
+		channels = []*domain.Channel{}
+	}
+
+	vacancies, errVac := h.vacancyRepo.GetAllVacancies(ctx)
+	if errVac != nil {
+		log.Printf("[ERROR] Failed to get vacancies for stats: %v", errVac)
+		vacancies = []*domain.Vacancy{}
+	}
+
+	skills, errSkills := h.skillRepo.GetUserSkills(ctx)
+	if errSkills != nil {
+		log.Printf("[ERROR] Failed to get skills for stats: %v", errSkills)
+		skills = []*domain.UserSkill{}
+	}
+
 	latestCV, _ := h.cvRepo.GetLatestCV(ctx)
 
 	// Считаем анализированные вакансии
@@ -569,22 +608,28 @@ func (h *TelegramCommandHandler) cmdCheck(ctx context.Context) error {
 	// Получаем все активные каналы
 	channels, err := h.manageChannelsUC.GetAllChannels(ctx)
 	if err != nil {
-		return h.sendMessage(fmt.Sprintf("❌ Ошибка при получении каналов: %v", err))
+		log.Printf("[ERROR] Failed to get channels: %v", err)
+		return h.sendMessage("❌ Ошибка при получении каналов\n\n💡 Попробуйте позже")
 	}
 
 	if len(channels) == 0 {
-		return h.sendMessage("❌ Ты не добавил ни один канал для проверки\n\nНапиши /add_channel @channel_name для начала")
+		return h.sendMessage("❌ Нет добавленных каналов\n\n✅ Добавьте каналы:\n/add_channel @golang_jobs")
 	}
 
-	h.sendMessage(fmt.Sprintf("⏳ Вручную проверяю %d канал(ов) прямо сейчас...", len(channels)))
+	h.sendMessage(fmt.Sprintf("⏳ Проверяю %d канал(ов)...\n\n🔍 Это может занять несколько секунд", len(channels)))
 
 	// Запускаем проверку вакансий
 	err = h.fetchAnalyzeUC.Execute(ctx, channels)
 	if err != nil {
-		return h.sendMessage(fmt.Sprintf("❌ Ошибка при проверке: %v", err))
+		log.Printf("[ERROR] Failed to check vacancies: %v", err)
+		errorMsg := fmt.Sprintf("❌ Ошибка при проверке\n\n%v", err)
+		if strings.Contains(err.Error(), "network") || strings.Contains(err.Error(), "connection") {
+			errorMsg = "❌ Ошибка подключения\n\n💡 Проверьте интернет и попробуйте позже"
+		}
+		return h.sendMessage(errorMsg)
 	}
 
-	return h.sendMessage("✅ Проверка завершена! Если найдены подходящие вакансии - отправлены выше.\n\n(Обычно это происходит автоматически каждые 30 минут ⏰)")
+	return h.sendMessage("✅ Проверка завершена!\n\n📋 Используйте /vacancies чтобы увидеть все найденные вакансии\n\n⏰ Автоматическая проверка идет каждые 30 минут")
 }
 
 // cmdVacancies - показать все сохраненные вакансии с pagination
@@ -593,11 +638,12 @@ func (h *TelegramCommandHandler) cmdVacancies(ctx context.Context, page int) err
 
 	vacancies, err := h.vacancyRepo.GetAllVacancies(ctx)
 	if err != nil {
-		return h.sendMessage(fmt.Sprintf("❌ Ошибка при получении вакансий: %v", err))
+		log.Printf("[ERROR] Failed to get vacancies: %v", err)
+		return h.sendMessage("❌ Ошибка при получении вакансий\n\n💡 Попробуйте позже или используйте /check для новой проверки")
 	}
 
 	if len(vacancies) == 0 {
-		return h.sendMessage("📋 На данный момент нет сохраненных вакансий\n\nОжидайте ⏰ Проверка идет автоматически каждые 30 минут")
+		return h.sendMessage("📋 Вакансий пока не найдено\n\n⏰ Авто проверка каждые 30 минут\n✅ Или проверьте вручную: /check\n\n💡 Убедитесь что:\n• Загружено резюме\n• Добавлены каналы в отслеживание")
 	}
 
 	// Рассчитываем pagination
@@ -730,6 +776,17 @@ func (h *TelegramCommandHandler) sendMessage(text string) error {
 
 	_, err := h.bot.Send(msg)
 	return err
+}
+
+// sendMessageSimple отправляет сообщение БЕЗ меню и возвращает ID
+func (h *TelegramCommandHandler) sendMessageSimple(text string) (int, error) {
+	msg := tgbotapi.NewMessage(h.chatID, text)
+
+	result, err := h.bot.Send(msg)
+	if err != nil {
+		return 0, err
+	}
+	return result.MessageID, nil
 }
 
 // sendMessageWithMenu отправляет сообщение с меню
