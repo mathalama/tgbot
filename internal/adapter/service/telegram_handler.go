@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
+	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
@@ -40,6 +42,7 @@ type TelegramCommandHandler struct {
 	analyzeCVUC      AnalyzeCVExecutor
 	manageChannelsUC ManageChannelsExecutor
 	fetchAnalyzeUC   FetchAndAnalyzeExecutor
+	vacancyPage      int // текущая страница вакансий
 }
 
 // NewTelegramCommandHandler создает новый обработчик команд
@@ -83,6 +86,23 @@ func (h *TelegramCommandHandler) HandleMessage(ctx context.Context, update tgbot
 	message := update.Message.Text
 	log.Printf("[TG] Received: %s", message)
 
+	// Проверяем на нажатие кнопок меню
+	switch message {
+	case "📋 Мои вакансии":
+		h.vacancyPage = 1
+		return h.cmdVacancies(ctx, 1)
+	case "📊 Статистика":
+		return h.cmdStats(ctx)
+	case "👤 Мой CV":
+		return h.cmdMyCV(ctx)
+	case "🔗 Каналы":
+		return h.cmdMyChannels(ctx)
+	case "⚡ Проверить":
+		return h.cmdCheck(ctx)
+	case "ℹ️ Помощь":
+		return h.cmdHelp(ctx)
+	}
+
 	// Обработка команд
 	if strings.HasPrefix(message, "/") {
 		return h.handleCommand(ctx, update)
@@ -106,6 +126,8 @@ func (h *TelegramCommandHandler) handleCommand(ctx context.Context, update tgbot
 	switch command {
 	case "/start":
 		return h.cmdStart(ctx)
+	case "/menu":
+		return h.sendMessageWithMenu("📋 Главное меню", "Выберите нужное действие:")
 	case "/help":
 		return h.cmdHelp(ctx)
 	case "/add_channel":
@@ -124,12 +146,15 @@ func (h *TelegramCommandHandler) handleCommand(ctx context.Context, update tgbot
 		return h.cmdMyCV(ctx)
 	case "/stats":
 		return h.cmdStats(ctx)
+	case "/status":
+		return h.cmdStatus(ctx)
 	case "/check":
 		return h.cmdCheck(ctx)
 	case "/vacancies":
-		return h.cmdVacancies(ctx)
+		h.vacancyPage = 1
+		return h.cmdVacancies(ctx, 1)
 	case "/clear_vacancies":
-		return h.cmdClearVacancies(ctx)
+		return h.cmdClearVacanciesConfirm(ctx)
 	default:
 		return h.sendMessage(fmt.Sprintf("❌ Неизвестная команда: %s\nУпишите /help для справки", command))
 	}
@@ -444,8 +469,97 @@ func (h *TelegramCommandHandler) cmdMyCV(ctx context.Context) error {
 
 // cmdStats - статистика
 func (h *TelegramCommandHandler) cmdStats(ctx context.Context) error {
-	text := "📊 Статистика:\n\n"
-	text += "⏳ Функция в разработке\n"
+	// Получаем статистику
+	channels, _ := h.manageChannelsUC.GetAllChannels(ctx)
+	vacancies, _ := h.vacancyRepo.GetAllVacancies(ctx)
+	skills, _ := h.skillRepo.GetUserSkills(ctx)
+	latestCV, _ := h.cvRepo.GetLatestCV(ctx)
+
+	// Считаем анализированные вакансии
+	analyzedCount := 0
+	for _, v := range vacancies {
+		if v.Analyzed {
+			analyzedCount++
+		}
+	}
+
+	text := `📊 СТАТИСТИКА
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📈 ОСНОВНАЯ ИНФОРМАЦИЯ
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+`
+
+	if latestCV != nil {
+		text += fmt.Sprintf("✅ Резюме загружено: %s назад\n", formatTime(time.Until(parseTime(latestCV.UploadedAt))))
+	} else {
+		text += "❌ Резюме не загружено\n"
+	}
+
+	text += fmt.Sprintf(`
+🔗 Отслеживаемые каналы: %d
+📋 Всего вакансий: %d
+✅ Анализировано: %d / %d
+💾 Найденных навыков: %d
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🎯 НАВЫКИ ПО КАТЕГОРИЯМ
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
+		len(channels),
+		len(vacancies),
+		analyzedCount,
+		len(vacancies),
+		len(skills),
+	)
+
+	// Группируем навыки по категориям
+	categories := make(map[string]int)
+	for _, skill := range skills {
+		categories[skill.Category]++
+	}
+
+	// Фиксированный порядок категорий
+	categoryOrder := []string{
+		"Language",
+		"Framework",
+		"Database",
+		"Platform",
+		"Tool",
+		"Soft Skill",
+	}
+
+	for _, cat := range categoryOrder {
+		count := categories[cat]
+		if count > 0 {
+			text += fmt.Sprintf("\n%-12s: %d", cat, count)
+		}
+	}
+
+	text += `
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✨ СОВЕТЫ
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+`
+
+	// Даём советы на основе статистики
+	if len(channels) == 0 {
+		text += "📌 Добавь хотя бы один канал (/add_channel)\n"
+	}
+	if len(skills) == 0 {
+		text += "📌 Загрузи своё резюме для анализа\n"
+	}
+	if len(vacancies) == 0 {
+		text += "📌 Жди автоматической проверки каждые 30 минут\n"
+	}
+	if len(vacancies) > 0 && analyzedCount < len(vacancies)/2 {
+		text += "📌 Много непроанализированных вакансий - проверь их командой /check\n"
+	}
+
+	text += `
+
+⏰ Автоматическая проверка: каждые 30 минут
+🗑️ Вакансии удаляются: через 7 дней`
 
 	return h.sendMessage(text)
 }
@@ -473,8 +587,10 @@ func (h *TelegramCommandHandler) cmdCheck(ctx context.Context) error {
 	return h.sendMessage("✅ Проверка завершена! Если найдены подходящие вакансии - отправлены выше.\n\n(Обычно это происходит автоматически каждые 30 минут ⏰)")
 }
 
-// cmdVacancies - показать все сохраненные вакансии
-func (h *TelegramCommandHandler) cmdVacancies(ctx context.Context) error {
+// cmdVacancies - показать все сохраненные вакансии с pagination
+func (h *TelegramCommandHandler) cmdVacancies(ctx context.Context, page int) error {
+	const itemsPerPage = 5
+
 	vacancies, err := h.vacancyRepo.GetAllVacancies(ctx)
 	if err != nil {
 		return h.sendMessage(fmt.Sprintf("❌ Ошибка при получении вакансий: %v", err))
@@ -484,46 +600,89 @@ func (h *TelegramCommandHandler) cmdVacancies(ctx context.Context) error {
 		return h.sendMessage("📋 На данный момент нет сохраненных вакансий\n\nОжидайте ⏰ Проверка идет автоматически каждые 30 минут")
 	}
 
-	// Форматируем список вакансий
-	text := fmt.Sprintf("📋 Все вакансии (%d):\n\n", len(vacancies))
-	for i, vacancy := range vacancies {
-		analyzed := "❌"
-		if vacancy.Analyzed {
-			analyzed = "✅"
+	// Рассчитываем pagination
+	totalPages := (len(vacancies) + itemsPerPage - 1) / itemsPerPage
+	if page < 1 {
+		page = 1
+	}
+	if page > totalPages {
+		page = totalPages
+	}
+
+	startIdx := (page - 1) * itemsPerPage
+	endIdx := startIdx + itemsPerPage
+	if endIdx > len(vacancies) {
+		endIdx = len(vacancies)
+	}
+
+	// Формируем текст
+	text := fmt.Sprintf("📋 Вакансии (страница %d из %d)\n\n", page, totalPages)
+
+	for i := startIdx; i < endIdx; i++ {
+		v := vacancies[i]
+		analyzed := "✅"
+		if !v.Analyzed {
+			analyzed = "⏳"
 		}
-		text += fmt.Sprintf("%d. %s\n   📍 @%s | 💼 %s\n   %s Анализировано\n\n",
-			i+1,
-			vacancy.Title,
-			vacancy.Source,
-			vacancy.Recruiter,
+
+		// Укороченная вакансия для экономии места
+		title := v.Title
+		if len(title) > 30 {
+			title = title[:27] + "..."
+		}
+
+		text += fmt.Sprintf("%d. %s\n", i+1, title)
+		text += fmt.Sprintf("   %s %s | @%s\n\n",
 			analyzed,
+			v.Recruiter,
+			v.Source,
 		)
 	}
 
-	// Если слишком длинный текст, отправляем частями
-	if len(text) > 4000 {
-		parts := strings.Split(text, "\n\n")
-		currentMsg := fmt.Sprintf("📋 Все вакансии (%d):\n\n", len(vacancies))
+	// Создаём inline кнопки для pagination
+	row := []tgbotapi.InlineKeyboardButton{}
 
-		for _, part := range parts {
-			if len(currentMsg)+len(part)+2 > 4000 {
-				h.sendMessage(currentMsg)
-				currentMsg = part + "\n\n"
-			} else {
-				currentMsg += part + "\n\n"
-			}
-		}
-
-		if currentMsg != "" {
-			return h.sendMessage(currentMsg)
-		}
+	if page > 1 {
+		row = append(row, tgbotapi.NewInlineKeyboardButtonData("⬅️ Назад", fmt.Sprintf("vac_page_%d", page-1)))
 	}
 
-	return h.sendMessage(text)
+	row = append(row, tgbotapi.NewInlineKeyboardButtonData(
+		fmt.Sprintf("%d/%d", page, totalPages),
+		"vac_info",
+	))
+
+	if page < totalPages {
+		row = append(row, tgbotapi.NewInlineKeyboardButtonData("Далее ➡️", fmt.Sprintf("vac_page_%d", page+1)))
+	}
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(row)
+
+	msg := tgbotapi.NewMessage(h.chatID, text)
+	msg.ReplyMarkup = keyboard
+
+	_, err = h.bot.Send(msg)
+	return err
 }
 
-// cmdClearVacancies - очистить все вакансии
-func (h *TelegramCommandHandler) cmdClearVacancies(ctx context.Context) error {
+// cmdClearVacanciesConfirm - подтверждение перед очисткой
+func (h *TelegramCommandHandler) cmdClearVacanciesConfirm(ctx context.Context) error {
+	// Inline кнопки для подтверждения
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("✅ Да, удалить ВСЕ", "clear_confirm_yes"),
+			tgbotapi.NewInlineKeyboardButtonData("❌ Отмена", "clear_confirm_no"),
+		),
+	)
+
+	msg := tgbotapi.NewMessage(h.chatID, "⚠️ Вы уверены?\n\nЭто удалит ВСЕ вакансии из базы данных 🗑️")
+	msg.ReplyMarkup = keyboard
+
+	_, err := h.bot.Send(msg)
+	return err
+}
+
+// cmdClearVacanciesExecute - непосредственное удаление
+func (h *TelegramCommandHandler) cmdClearVacanciesExecute(ctx context.Context) error {
 	err := h.vacancyRepo.DeleteAll(ctx)
 	if err != nil {
 		return h.sendMessage(fmt.Sprintf("❌ Ошибка при удалении: %v", err))
@@ -531,10 +690,231 @@ func (h *TelegramCommandHandler) cmdClearVacancies(ctx context.Context) error {
 	return h.sendMessage("✅ Все вакансии успешно удалены!\n\nИспользуйте /check для загрузки новых вакансий.")
 }
 
-// sendMessage отправляет сообщение
+// cmdStatus - статус бота
+func (h *TelegramCommandHandler) cmdStatus(ctx context.Context) error {
+	channels, _ := h.manageChannelsUC.GetAllChannels(ctx)
+	vacancies, _ := h.vacancyRepo.GetAllVacancies(ctx)
+	skills, _ := h.skillRepo.GetUserSkills(ctx)
+
+	activeChannels := 0
+	for _, ch := range channels {
+		if ch.IsActive {
+			activeChannels++
+		}
+	}
+
+	text := `🤖 СТАТУС БОТА
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✅ БОТ АКТИВЕН И РАБОТАЕТ
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📌 Активные каналы: %d / %d
+📊 Вакансий в БД: %d
+💾 Навыков найдено: %d
+
+🔄 Расписание:
+• Автоматическая проверка: каждые 30 минут
+• Удаление старых вакансий: через 7 дней
+
+⚙️ Готов к работе!
+Напиши /menu для быстрого доступа к функциям`
+
+	return h.sendMessage(fmt.Sprintf(text, activeChannels, len(channels), len(vacancies), len(skills)))
+}
+
+// sendMessage отправляет сообщение с главным меню
 func (h *TelegramCommandHandler) sendMessage(text string) error {
 	msg := tgbotapi.NewMessage(h.chatID, text)
+	msg.ReplyMarkup = h.getMainKeyboard()
 
 	_, err := h.bot.Send(msg)
 	return err
+}
+
+// sendMessageWithMenu отправляет сообщение с меню
+func (h *TelegramCommandHandler) sendMessageWithMenu(title, subtitle string) error {
+	text := fmt.Sprintf("💬 %s\n%s", title, subtitle)
+	msg := tgbotapi.NewMessage(h.chatID, text)
+	msg.ReplyMarkup = h.getMainKeyboard()
+
+	_, err := h.bot.Send(msg)
+	return err
+}
+
+// getMainKeyboard возвращает главное меню
+func (h *TelegramCommandHandler) getMainKeyboard() tgbotapi.ReplyKeyboardMarkup {
+	keyboard := tgbotapi.NewReplyKeyboard(
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton("📋 Мои вакансии"),
+			tgbotapi.NewKeyboardButton("📊 Статистика"),
+		),
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton("👤 Мой CV"),
+			tgbotapi.NewKeyboardButton("🔗 Каналы"),
+		),
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton("⚡ Проверить"),
+			tgbotapi.NewKeyboardButton("ℹ️ Помощь"),
+		),
+	)
+	keyboard.ResizeKeyboard = true
+	return keyboard
+}
+
+// HandleCallbackQuery обрабатывает нажатие inline кнопок
+func (h *TelegramCommandHandler) HandleCallbackQuery(ctx context.Context, query *tgbotapi.CallbackQuery) error {
+	data := query.Data
+
+	// Удаляем "loading" эффект
+	cb := tgbotapi.NewCallback(query.ID, "")
+	h.bot.Request(cb)
+
+	switch {
+	case strings.HasPrefix(data, "vac_page_"):
+		pageStr := strings.TrimPrefix(data, "vac_page_")
+		page, err := strconv.Atoi(pageStr)
+		if err != nil {
+			return nil
+		}
+		return h.updateVacanciesPage(ctx, query.Message.MessageID, page)
+
+	case data == "vac_info":
+		// Не делаем ничего при нажатии на номер страницы
+		return nil
+
+	case data == "clear_confirm_yes":
+		h.editMessageText(query.Message.MessageID, "⏳ Удаляю вакансии...")
+		return h.cmdClearVacanciesExecute(ctx)
+
+	case data == "clear_confirm_no":
+		return h.editMessageText(query.Message.MessageID, "❌ Удаление отменено")
+
+	default:
+		return nil
+	}
+}
+
+// updateVacanciesPage обновляет страницу вакансий
+func (h *TelegramCommandHandler) updateVacanciesPage(ctx context.Context, messageID int, page int) error {
+	const itemsPerPage = 5
+
+	vacancies, err := h.vacancyRepo.GetAllVacancies(ctx)
+	if err != nil {
+		return nil
+	}
+
+	if len(vacancies) == 0 {
+		return nil
+	}
+
+	// Рассчитываем pagination
+	totalPages := (len(vacancies) + itemsPerPage - 1) / itemsPerPage
+	if page < 1 {
+		page = 1
+	}
+	if page > totalPages {
+		page = totalPages
+	}
+
+	startIdx := (page - 1) * itemsPerPage
+	endIdx := startIdx + itemsPerPage
+	if endIdx > len(vacancies) {
+		endIdx = len(vacancies)
+	}
+
+	// Формируем текст
+	text := fmt.Sprintf("📋 Вакансии (страница %d из %d)\n\n", page, totalPages)
+
+	for i := startIdx; i < endIdx; i++ {
+		v := vacancies[i]
+		analyzed := "✅"
+		if !v.Analyzed {
+			analyzed = "⏳"
+		}
+
+		title := v.Title
+		if len(title) > 30 {
+			title = title[:27] + "..."
+		}
+
+		text += fmt.Sprintf("%d. %s\n", i+1, title)
+		text += fmt.Sprintf("   %s %s | @%s\n\n",
+			analyzed,
+			v.Recruiter,
+			v.Source,
+		)
+	}
+
+	// Создаём inline кнопки
+	row := []tgbotapi.InlineKeyboardButton{}
+
+	if page > 1 {
+		row = append(row, tgbotapi.NewInlineKeyboardButtonData("⬅️ Назад", fmt.Sprintf("vac_page_%d", page-1)))
+	}
+
+	row = append(row, tgbotapi.NewInlineKeyboardButtonData(
+		fmt.Sprintf("%d/%d", page, totalPages),
+		"vac_info",
+	))
+
+	if page < totalPages {
+		row = append(row, tgbotapi.NewInlineKeyboardButtonData("Далее ➡️", fmt.Sprintf("vac_page_%d", page+1)))
+	}
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(row)
+
+	// Редактируем сообщение
+	edit := tgbotapi.NewEditMessageText(h.chatID, messageID, text)
+	edit.ReplyMarkup = &keyboard
+
+	_, err = h.bot.Send(edit)
+	return err
+}
+
+// editMessageText редактирует текст сообщения
+func (h *TelegramCommandHandler) editMessageText(messageID int, text string) error {
+	edit := tgbotapi.NewEditMessageText(h.chatID, messageID, text)
+	_, err := h.bot.Send(edit)
+	return err
+}
+
+// formatTime красиво форматирует время
+func formatTime(duration time.Duration) string {
+	if duration < 0 {
+		return "неизвестно"
+	}
+
+	hours := int(duration.Hours())
+	minutes := int(duration.Minutes()) % 60
+
+	if hours == 0 && minutes == 0 {
+		return "только что"
+	}
+	if hours == 0 {
+		return fmt.Sprintf("%d мин", minutes)
+	}
+	if hours < 24 {
+		return fmt.Sprintf("%d ч %d мин", hours, minutes)
+	}
+
+	days := hours / 24
+	hours = hours % 24
+	if days == 1 {
+		return "вчера"
+	}
+	return fmt.Sprintf("%d дн назад", days)
+}
+
+// parseTime парсит время из строки
+func parseTime(timeStr string) time.Time {
+	t, err := time.Parse(time.RFC3339, timeStr)
+	if err != nil {
+		// Пытаемся другие форматы
+		t, err = time.Parse("2006-01-02 15:04:05", timeStr)
+		if err != nil {
+			return time.Now()
+		}
+	}
+	return t
 }
