@@ -32,17 +32,18 @@ type FetchAndAnalyzeExecutor interface {
 
 // TelegramCommandHandler обрабатывает Telegram команды
 type TelegramCommandHandler struct {
-	bot              *tgbotapi.BotAPI
-	chatID           int64
-	cvRepo           domain.CVRepository
-	skillRepo        domain.SkillRepository
-	channelRepo      domain.ChannelRepository
-	vacancyRepo      domain.VacancyRepository
-	cvAnalyzer       *CVAnalyzer
-	analyzeCVUC      AnalyzeCVExecutor
-	manageChannelsUC ManageChannelsExecutor
-	fetchAnalyzeUC   FetchAndAnalyzeExecutor
-	vacancyPage      int // текущая страница вакансий
+	bot               *tgbotapi.BotAPI
+	chatID            int64
+	cvRepo            domain.CVRepository
+	skillRepo         domain.SkillRepository
+	channelRepo       domain.ChannelRepository
+	vacancyRepo       domain.VacancyRepository
+	cvAnalyzer        *CVAnalyzer
+	streamingAnalyzer *StreamingCVAnalyzer
+	analyzeCVUC       AnalyzeCVExecutor
+	manageChannelsUC  ManageChannelsExecutor
+	fetchAnalyzeUC    FetchAndAnalyzeExecutor
+	vacancyPage       int // текущая страница вакансий
 }
 
 // NewTelegramCommandHandler создает новый обработчик команд
@@ -58,7 +59,7 @@ func NewTelegramCommandHandler(
 	manageChannelsUC ManageChannelsExecutor,
 	fetchAnalyzeUC FetchAndAnalyzeExecutor,
 ) *TelegramCommandHandler {
-	return &TelegramCommandHandler{
+	handler := &TelegramCommandHandler{
 		bot:              bot,
 		chatID:           chatID,
 		cvRepo:           cvRepo,
@@ -70,6 +71,11 @@ func NewTelegramCommandHandler(
 		manageChannelsUC: manageChannelsUC,
 		fetchAnalyzeUC:   fetchAnalyzeUC,
 	}
+
+	// Инициализируем streaming analyzer если есть API key
+	// (ленивая инициализация в cmdStreamAnalyze)
+
+	return handler
 }
 
 // HandleMessage обрабатывает входящее сообщение
@@ -155,6 +161,8 @@ func (h *TelegramCommandHandler) handleCommand(ctx context.Context, update tgbot
 		return h.cmdVacancies(ctx, 1)
 	case "/clear_vacancies":
 		return h.cmdClearVacanciesConfirm(ctx)
+	case "/stream_analyze":
+		return h.cmdStreamAnalyze(ctx)
 	default:
 		return h.sendMessage(fmt.Sprintf("❌ Неизвестная команда: %s\nУпишите /help для справки", command))
 	}
@@ -320,6 +328,10 @@ func (h *TelegramCommandHandler) cmdHelp(ctx context.Context) error {
 
 /stats
    → Статистика совпадений
+
+/stream_analyze (ЭКСПЕРИМЕНТАЛЬНО)
+   → Анализ CV с real-time стримингом 🚀
+   → Вы видите результаты в реальном времени!
 
 /help
    → Эта справка
@@ -961,6 +973,123 @@ func formatTime(duration time.Duration) string {
 		return "вчера"
 	}
 	return fmt.Sprintf("%d дн назад", days)
+}
+
+// cmdStreamAnalyze - команда для демонстрации streaming анализа
+// Требует загруженного CV файла
+func (h *TelegramCommandHandler) cmdStreamAnalyze(ctx context.Context) error {
+	// Получаем последнее загруженное резюме
+	latestCV, err := h.cvRepo.GetLatestCV(ctx)
+	if err != nil {
+		log.Printf("[ERROR] Failed to get latest CV: %v", err)
+		return h.sendMessage("❌ Ошибка при получении резюме\n\n💡 Загрузите резюме сначала")
+	}
+
+	if latestCV == nil {
+		return h.sendMessage("📭 Резюме не загружено\n\n💡 Отправьте файл своего резюме сначала")
+	}
+
+	// Инициализируем streaming analyzer при первом использовании
+	if h.streamingAnalyzer == nil {
+		// Используем API key из существующего CVAnalyzer
+		h.streamingAnalyzer = NewStreamingCVAnalyzer(h.cvAnalyzer.apiKey)
+	}
+
+	// Отправляем начальное сообщение
+	initialMsg, err := h.sendMessageSimple("⏳ 🔄 Анализирую CV с стримингом...\n\n_Результаты будут обновляться в реальном времени_")
+	if err != nil {
+		return err
+	}
+
+	// Создаем streamer для обновления этого сообщения
+	config := StreamConfig{
+		UpdateInterval:   500 * time.Millisecond,
+		BufferThreshold:  100,
+		MaxBufferSize:    1500,
+		ShowTypingStatus: true,
+	}
+
+	updater := NewStreamingMessageUpdater(h.bot, h.chatID, initialMsg, config)
+
+	// Создаем writer для streaming
+	writer := updater.NewStreamWriter(ctx)
+
+	// Запускаем анализ с streaming
+	go func() {
+		log.Printf("[STREAM] Starting streaming analysis...")
+
+		// Анализируем CV с выводом в stream writer
+		skillMap, err := h.streamingAnalyzer.AnalyzeWithStreaming(ctx, latestCV.CVText, writer)
+		if err != nil {
+			log.Printf("[ERROR] Streaming analysis failed: %v", err)
+			updater.Cancel()
+			_ = h.sendMessage(fmt.Sprintf("❌ Ошибка при анализе: %v", err))
+			return
+		}
+
+		// Завершаем streaming
+		_ = updater.Flush(ctx)
+
+		log.Printf("[STREAM] Analysis complete, found skills: %d", len(skillMap))
+
+		// Отправляем итоговое резюме
+		summary := h.buildSkillSummary(skillMap)
+		_ = h.sendMessage(summary)
+	}()
+
+	return nil
+}
+
+// buildSkillSummary строит красивое резюме найденных навыков
+func (h *TelegramCommandHandler) buildSkillSummary(skillMap map[string][]string) string {
+	if len(skillMap) == 0 {
+		return "⚠️ Навыки не найдены"
+	}
+
+	text := "✅ Анализ завершен!\n\n📊 Найденные навыки:\n\n"
+
+	categoryOrder := []string{
+		"Language",
+		"Framework",
+		"Database",
+		"Platform",
+		"Tool",
+		"Soft Skill",
+	}
+
+	categoryIcons := map[string]string{
+		"Language":   "🎨",
+		"Database":   "💾",
+		"Framework":  "🏗️",
+		"Tool":       "🔧",
+		"Platform":   "☁️",
+		"Soft Skill": "👤",
+	}
+
+	for _, category := range categoryOrder {
+		skills, exists := skillMap[category]
+		if !exists || len(skills) == 0 {
+			continue
+		}
+
+		icon := categoryIcons[category]
+		if icon == "" {
+			icon = "▸"
+		}
+
+		text += fmt.Sprintf("%s **%s** (%d):\n", icon, category, len(skills))
+		for j, skill := range skills {
+			isLast := (j == len(skills)-1)
+			prefix := "├─ "
+			if isLast {
+				prefix = "└─ "
+			}
+			text += fmt.Sprintf("%s`%s`\n", prefix, skill)
+		}
+		text += "\n"
+	}
+
+	return text
 }
 
 // parseTime парсит время из строки
